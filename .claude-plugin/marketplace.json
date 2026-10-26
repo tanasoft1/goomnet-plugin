@@ -1,0 +1,15 @@
+{
+  "name": "tanasoft",
+  "description": "Tanasoft's internal Claude Code plugins",
+  "owner": {
+    "name": "Tanasoft",
+    "email": "enkhuchral.g@tanasoft.mn"
+  },
+  "plugins": [
+    {
+      "name": "goomnet",
+      "source": "./",
+      "description": "Read and write the goomnet project tracker (goomnet.tanasoft.mn)"
+    }
+  ]
+}

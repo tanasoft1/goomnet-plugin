@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# goomnet — CLI for the goomnet-backend API (https://goomnet.tanasoft.mn)
+#
+# Auth: POST /api/web/public/login/ -> {JWT, refresh_token}; Bearer on /api/web/private/*.
+# Token + refresh token are cached in .token and auto-refreshed on 401.
+# Output is always raw JSON on stdout — pipe through jq.
+#
+# Domain model:
+#   channel  = container / board / "project" (hierarchical)
+#   contents = items inside a channel = tasks / tickets
+#   comments, members, labels hang off those.
+
+set -euo pipefail
+
+D="${GOOMNET_HOME:-$HOME/.claude/goomnet}"
+ENV_FILE="$D/.env"
+TOKEN_FILE="$D/.token"
+
+die_unconfigured() {
+  echo "goomnet: not configured ($ENV_FILE is missing)." >&2
+  echo "In Claude Code: /plugin > Installed > goomnet > Configure options, then start a new session." >&2
+  exit 1
+}
+
+[ -f "$ENV_FILE" ] || die_unconfigured
+# shellcheck disable=SC1090
+set -a; . "$ENV_FILE"; set +a
+: "${GOOMNET_URL:?not set in .env}"
+: "${GOOMNET_EMAIL:?not set in .env}"
+: "${GOOMNET_PASSWORD:?not set in .env}"
+
+API="$GOOMNET_URL/api/web"
+PUB="$API/public"
+PRIV="$API/private"
+
+die() { echo "goomnet: $*" >&2; exit 1; }
+
+# ---------- auth ----------
+
+save_tokens() {  # <json>
+  local j="$1" jwt rt
+  jwt=$(jq -r '.JWT // empty' <<<"$j")
+  rt=$(jq -r '.refresh_token // empty' <<<"$j")
+  [ -n "$jwt" ] || die "login response had no JWT: $j"
+  printf '%s\n%s\n' "$jwt" "$rt" > "$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+}
+
+do_login() {
+  local body resp
+  body=$(jq -nc --arg e "$GOOMNET_EMAIL" --arg p "$GOOMNET_PASSWORD" \
+            '{email:$e, password:$p}')
+  resp=$(curl -sS -m 30 -X POST "$PUB/login/" \
+           -H 'Content-Type: application/json' -d "$body") || die "login request failed"
+  save_tokens "$resp"
+}
+
+do_refresh() {  # returns non-zero if refresh is not possible
+  local rt resp
+  [ -f "$TOKEN_FILE" ] || return 1
+  rt=$(sed -n 2p "$TOKEN_FILE")
+  [ -n "$rt" ] || return 1
+  resp=$(curl -sS -m 30 -X POST "$PUB/refresh-token/" \
+           -H 'Content-Type: application/json' \
+           -d "$(jq -nc --arg r "$rt" '{refresh_token:$r}')") || return 1
+  jq -e '.JWT' >/dev/null 2>&1 <<<"$resp" || return 1
+  save_tokens "$resp"
+}
+
+token() {
+  [ -f "$TOKEN_FILE" ] || do_login
+  sed -n 1p "$TOKEN_FILE"
+}
+
+# ---------- request plumbing ----------
+# api <METHOD> <path-after-/private> [json-body] [curl-extra-args...]
+# Retries once through refresh (then a full login) on 401.
+api() {
+  local method="$1" path="$2" body="${3:-}"; shift 3 || shift $#
+  local attempt=0 out code
+
+  while :; do
+    local -a args=(-sS -m 60 -o - -w '\n%{http_code}' -X "$method" "$PRIV$path"
+                   -H "Authorization: Bearer $(token)")
+    [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+    [ $# -gt 0 ] && args+=("$@")
+
+    out=$(curl "${args[@]}") || die "request failed: $method $path"
+    code=$(tail -n1 <<<"$out")
+    out=$(sed '$d' <<<"$out")
+
+    if [ "$code" = "401" ] && [ "$attempt" -lt 2 ]; then
+      attempt=$((attempt+1))
+      if [ "$attempt" = 1 ]; then do_refresh || do_login; else do_login; fi
+      continue
+    fi
+    break
+  done
+
+  case "$code" in
+    2*) printf '%s\n' "$out" ;;
+    *)  echo "goomnet: HTTP $code on $method $path" >&2
+        printf '%s\n' "$out" >&2
+        exit 1 ;;
+  esac
+}
+
+# GET with query params: qget <path> [key value]...
+qget() {
+  local path="$1"; shift
+  local -a q=()
+  while [ $# -gt 1 ]; do
+    [ -n "$2" ] && q+=(--get --data-urlencode "$1=$2")
+    shift 2
+  done
+  api GET "$path" "" ${q[@]+"${q[@]}"}
+}
+
+# Guard: the deletes we agreed are out of scope.
+guard_delete() {  # <method> <path>
+  [ "$1" = "DELETE" ] || return 0
+  case "$2" in
+    */label/*|*/content-label/*) return 0 ;;   # label deletes are in scope
+    /comments/*) return 0 ;;                   # own-comment deletes are in scope (see delete-comment)
+    /channel/*|/contents/*)
+      die "refusing DELETE $2 — destroying channels/tasks is out of scope for this tool (use the web UI)" ;;
+  esac
+}
+
+# Delete one comment, but ONLY if the caller wrote it.
+#
+# Authorship is verified client-side before deleting, and anything else is
+# refused unless --force is passed.
+#
+# The comment-list endpoint is keyed by content_id, not comment_id, so the
+# task id is required to resolve the author.
+delete_comment() {  # <content-id> <comment-id> [--force]
+  local content="$1" cid="$2" force="${3:-}" me owner
+  me=$(api GET "/user-emp/" "" | jq -r '.user_id // empty')
+  [ -n "$me" ] || die "could not resolve current user id"
+
+  owner=$(qget "/comments/" content_id "$content" limit 200 offset 0 \
+            | jq -r --argjson c "$cid" '(.channel_comments // .data // [])[]
+                     | select(.comment_id == $c) | .cr_by' | head -1)
+
+  [ -n "$owner" ] || die "comment $cid not found on content $content (already deleted?)"
+
+  if [ "$owner" != "$me" ]; then
+    [ "$force" = "--force" ] || die "comment $cid belongs to user $owner, not you ($me) — refusing. Pass --force only if you really mean it."
+  fi
+
+  api DELETE "/comments/$cid" ""
+}
+
+usage() {
+  sed -n '/^## USAGE/,/^## END/p' "$0" | sed '1d;$d;s/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+## USAGE
+# goomnet — read/write the goomnet project tracker
+#
+# READ
+#   me                            current user + employee info
+#   channels [--org N]            all channels you belong to
+#   tree [--org N] [--limit N]    channel hierarchy
+#   channel <channel-id>          channel detail
+#   tasks <channel-id> [filters]  tasks/tickets in a channel
+#       filters: --status S (repeatable)  --priority P (repeatable)
+#                --assignee N  --title TXT  --label N (repeatable)
+#                --from YYYY-MM-DD  --to YYYY-MM-DD  --on YYYY-MM-DD
+#                --pinned  --limit N  --offset N
+#   task <channel-id> <content-id>   one task in detail
+#   comments <content-id> [--limit N]
+#   members <channel-id>
+#   labels <channel-id>
+#   search <text> [--limit N]     search task content
+#   dashboard                     your cross-channel content
+#   stats                         your dashboard stats
+#   notifs [--limit N]            your notifications
+#   activity <channel-id>         channel activity timeline
+#
+# WRITE
+#   create-task <channel-id> <title> [--desc T] [--priority P] [--status S]
+#               [--assignee N] [--start D] [--end D] [--label N]
+#   update-task <channel-id> <content-id> [--title T] [--desc T] [--status S]
+#               [--priority P] [--assignee N] [--pinned true|false]
+#   comment <channel-id> <content-id> <text> [--reply-to COMMENT_ID]
+#   delete-comment <content-id> <comment-id> [--force]
+#                                 soft-delete a comment. Refuses unless YOU wrote it.
+#                                 --force overrides (be sure).
+#   label-create <channel-id> <name> [--color HEX]
+#
+# ESCAPE HATCH  (anything not covered above)
+#   raw <METHOD> <path-after-/api/web/private> [json-body]
+#   e.g. goomnet raw GET /report/task-channel
+#
+# AUTH
+#   login       force a fresh login (drops cached token)
+#   whoami      show cached token subject/expiry
+## END
+
+# ---------- commands ----------
+
+cmd="${1:-}"; [ -n "$cmd" ] && shift || usage 1
+
+case "$cmd" in
+
+  -h|--help|help) usage ;;
+
+  login)   rm -f "$TOKEN_FILE"; do_login; echo '{"ok":true,"msg":"logged in"}' ;;
+
+  whoami)
+    [ -f "$TOKEN_FILE" ] || die "no cached token — run: goomnet login"
+    sed -n 1p "$TOKEN_FILE" | cut -d. -f2 \
+      | { read -r p; printf '%s' "$p===" | tr '_-' '/+' | base64 -d 2>/dev/null || true; } \
+      | jq . 2>/dev/null || die "could not decode token payload"
+    ;;
+
+  me)      api GET "/user-emp/" ;;
+
+  channels)
+    org=""; [ "${1:-}" = "--org" ] && { org="$2"; shift 2; }
+    qget "/channel/all" org_id "$org"
+    ;;
+
+  tree)
+    org=""; limit=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --org) org="$2"; shift 2;; --limit) limit="$2"; shift 2;; *) die "unknown flag $1";;
+    esac; done
+    qget "/channel/hierarchy/list" org_id "$org" limit "$limit"
+    ;;
+
+  channel) [ $# -ge 1 ] || die "usage: goomnet channel <channel-id>"
+           api GET "/channel/detail/$1" ;;
+
+  tasks)
+    [ $# -ge 1 ] || die "usage: goomnet tasks <channel-id> [filters]"
+    cid="$1"; shift
+    # Repeatable filters have to be built as raw query args, not qget pairs.
+    q=(--get --data-urlencode "id=$cid")
+    limit=200; offset=0
+    while [ $# -gt 0 ]; do case "$1" in
+      --status)   q+=(--data-urlencode "status=$2");     shift 2;;
+      --priority) q+=(--data-urlencode "priority=$2");   shift 2;;
+      --label)    q+=(--data-urlencode "label_ids=$2");  shift 2;;
+      --assignee) q+=(--data-urlencode "assignee_id=$2");shift 2;;
+      --title)    q+=(--data-urlencode "title=$2");      shift 2;;
+      --from)     q+=(--data-urlencode "cr_date_from=$2");shift 2;;
+      --to)       q+=(--data-urlencode "cr_date_to=$2"); shift 2;;
+      --on)       q+=(--data-urlencode "cr_date_on=$2"); shift 2;;
+      --pinned)   q+=(--data-urlencode "is_pinned=true");shift;;
+      --limit)    limit="$2"; shift 2;;
+      --offset)   offset="$2"; shift 2;;
+      *) die "unknown flag $1";;
+    esac; done
+    q+=(--data-urlencode "limit=$limit" --data-urlencode "offset=$offset")
+    api GET "/contents/" "" ${q[@]+"${q[@]}"}
+    ;;
+
+  task)
+    [ $# -ge 2 ] || die "usage: goomnet task <channel-id> <content-id>"
+    qget "/contents/detail" id "$1" content_id "$2"
+    ;;
+
+  comments)
+    [ $# -ge 1 ] || die "usage: goomnet comments <content-id>"
+    cid="$1"; shift; limit=100
+    [ "${1:-}" = "--limit" ] && limit="$2"
+    qget "/comments/" content_id "$cid" limit "$limit" offset 0
+    ;;
+
+  members)  [ $# -ge 1 ] || die "usage: goomnet members <channel-id>"
+            qget "/members/" id "$1" limit 200 offset 0 ;;
+
+  labels)   [ $# -ge 1 ] || die "usage: goomnet labels <channel-id>"
+            api GET "/contents/label/$1" ;;
+
+  search)   [ $# -ge 1 ] || die "usage: goomnet search <text>"
+            txt="$1"; shift; limit=50
+            [ "${1:-}" = "--limit" ] && limit="$2"
+            qget "/contents/search" search "$txt" limit "$limit" offset 0 ;;
+
+  # Cross-channel "what's on my plate". NOTE: this endpoint uses PLURAL
+  # statuses/priorities, unlike /contents/ which uses the singular forms.
+  mine|dashboard)
+    own="ASSIGNED"; q=(--get); limit=100; offset=0
+    while [ $# -gt 0 ]; do case "$1" in
+      --own)      own=$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]'); shift 2;;
+      --status)   q+=(--data-urlencode "statuses=$2");   shift 2;;
+      --priority) q+=(--data-urlencode "priorities=$2"); shift 2;;
+      --search)   q+=(--data-urlencode "search=$2");     shift 2;;
+      --expired)  q+=(--data-urlencode "is_expired=true"); shift;;
+      --pinned)   q+=(--data-urlencode "is_pinned=true");  shift;;
+      --from)     q+=(--data-urlencode "cr_date_from=$2"); shift 2;;
+      --to)       q+=(--data-urlencode "cr_date_to=$2");   shift 2;;
+      --due-from) q+=(--data-urlencode "end_date_from=$2");shift 2;;
+      --due-to)   q+=(--data-urlencode "end_date_to=$2");  shift 2;;
+      --limit)    limit="$2"; shift 2;;
+      --offset)   offset="$2"; shift 2;;
+      *) die "unknown flag $1";;
+    esac; done
+    case "$own" in ASSIGNED|CREATED) ;; *) die "--own must be assigned or created";; esac
+    q+=(--data-urlencode "own_type=$own" --data-urlencode "limit=$limit" --data-urlencode "offset=$offset")
+    api GET "/dashboard/" "" "${q[@]}"
+    ;;
+
+  stats)     api GET "/dashboard/stats" ;;
+
+  notifs)   limit=30; [ "${1:-}" = "--limit" ] && limit="$2"
+            qget "/notif" limit "$limit" offset 0 ;;
+
+  activity) [ $# -ge 1 ] || die "usage: goomnet activity <channel-id>"
+            qget "/activity/channel" channel_id "$1" limit 50 offset 0 ;;
+
+  create-task)
+    [ $# -ge 2 ] || die "usage: goomnet create-task <channel-id> <title> [flags]"
+    cid="$1"; title="$2"; shift 2
+    body=$(jq -nc --argjson c "$cid" --arg t "$title" '{channel_id:$c, content_title:$t}')
+    while [ $# -gt 0 ]; do case "$1" in
+      --desc)     body=$(jq -c --arg v "$2" '.content_description=$v' <<<"$body"); shift 2;;
+      --priority) body=$(jq -c --arg v "$2" '.priority=$v'            <<<"$body"); shift 2;;
+      --status)   body=$(jq -c --arg v "$2" '.status=$v'              <<<"$body"); shift 2;;
+      --assignee) body=$(jq -c --argjson v "$2" '.assignee_id=$v'     <<<"$body"); shift 2;;
+      --start)    body=$(jq -c --arg v "$2" '.start_date=$v'          <<<"$body"); shift 2;;
+      --end)      body=$(jq -c --arg v "$2" '.end_date=$v'            <<<"$body"); shift 2;;
+      --label)    body=$(jq -c --argjson v "$2" '.label=((.label//[])+[$v])' <<<"$body"); shift 2;;
+      --pinned)   body=$(jq -c '.is_pinned=true'                      <<<"$body"); shift;;
+      *) die "unknown flag $1";;
+    esac; done
+    api POST "/contents/" "$body"
+    ;;
+
+  update-task)
+    [ $# -ge 2 ] || die "usage: goomnet update-task <channel-id> <content-id> [flags]"
+    cid="$1"; tid="$2"; shift 2
+    body=$(jq -nc --argjson c "$cid" --argjson t "$tid" '{channel_id:$c, content_id:$t}')
+    while [ $# -gt 0 ]; do case "$1" in
+      --title)    body=$(jq -c --arg v "$2" '.content_title=$v'       <<<"$body"); shift 2;;
+      --desc)     body=$(jq -c --arg v "$2" '.content_description=$v' <<<"$body"); shift 2;;
+      --status)   body=$(jq -c --arg v "$2" '.status=$v'              <<<"$body"); shift 2;;
+      --priority) body=$(jq -c --arg v "$2" '.priority=$v'            <<<"$body"); shift 2;;
+      --assignee) body=$(jq -c --argjson v "$2" '.assignee_id=$v'     <<<"$body"); shift 2;;
+      --pinned)   body=$(jq -c --argjson v "$2" '.is_pinned=$v'       <<<"$body"); shift 2;;
+      *) die "unknown flag $1";;
+    esac; done
+    api PUT "/contents/" "$body"
+    ;;
+
+  comment)
+    [ $# -ge 3 ] || die "usage: goomnet comment <channel-id> <content-id> <text>"
+    body=$(jq -nc --argjson c "$1" --argjson t "$2" --arg x "$3" \
+             '{channel_id:$c, content_id:$t, comment_text:$x}')
+    shift 3
+    [ "${1:-}" = "--reply-to" ] && body=$(jq -c --argjson v "$2" '.parent_comment_id=$v' <<<"$body")
+    api POST "/comments/" "$body"
+    ;;
+
+  delete-comment)
+    [ $# -ge 2 ] || die "usage: goomnet delete-comment <content-id> <comment-id> [--force]"
+    delete_comment "$1" "$2" "${3:-}"
+    ;;
+
+  label-create)
+    [ $# -ge 2 ] || die "usage: goomnet label-create <channel-id> <name> [--color HEX]"
+    body=$(jq -nc --argjson c "$1" --arg n "$2" '{channel_id:$c, label_name:$n}')
+    shift 2
+    [ "${1:-}" = "--color" ] && body=$(jq -c --arg v "$2" '.color=$v' <<<"$body")
+    api POST "/contents/label" "$body"
+    ;;
+
+  raw)
+    [ $# -ge 2 ] || die "usage: goomnet raw <METHOD> <path> [json-body]"
+    m="$1"; p="$2"; b="${3:-}"
+    guard_delete "$m" "$p"
+    api "$m" "$p" "$b"
+    ;;
+
+  *) die "unknown command '$cmd' — run: goomnet help" ;;
+esac
