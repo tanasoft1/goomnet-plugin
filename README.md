@@ -6,7 +6,7 @@ in goomnet?", "mark 3683 done") or use a slash command:
 
 | Command | What it shows |
 |---|---|
-| `/goomnet:mine [created \| all \| workspace]` | Your open tasks (TODO, IN_PROGRESS) grouped by workspace |
+| `/goomnet:mine [status] [created] [workspace]` | Your tasks grouped by workspace; filter by status (`todo`, `in_progress`, `done`, `cancelled`) |
 | `/goomnet:workspaces [name]` | Your workspaces with their projects and boards |
 | `/goomnet:people [workspace]` | Members of each workspace with their role; filter by workspace name |
 | `/goomnet:goomnet <request>` | Anything else, in plain language |
