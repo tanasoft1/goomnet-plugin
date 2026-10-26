@@ -201,7 +201,7 @@ usage() {
 #                --channel N  --type TASK|TICKET|INCIDENT  --search TXT
 #                --expired  --pinned  --from/--to D  --due-from/--due-to D
 #                --by-workspace (group rows under their workspace)
-#                --limit N  --offset N
+#                --limit N  --offset N  (one page only; by default all pages are fetched)
 #   notifs [--limit N] [--unread] your notifications
 #   activity <channel-id>         channel activity timeline
 #
@@ -326,7 +326,7 @@ case "$cmd" in
   # Cross-channel "what's on my plate". NOTE: this endpoint uses PLURAL
   # statuses/priorities, unlike /contents/ which uses the singular forms.
   mine|dashboard)
-    own="ASSIGNED"; q=(--get); limit=100; offset=0; by_ws=""
+    own="ASSIGNED"; q=(--get); limit=""; offset=""; by_ws=""
     while [ $# -gt 0 ]; do case "$1" in
       --own)      own=$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]'); shift 2;;
       --status)   q+=(--data-urlencode "statuses=$2");   shift 2;;
@@ -346,8 +346,25 @@ case "$cmd" in
       *) die "unknown flag $1";;
     esac; done
     case "$own" in ASSIGNED|CREATED) ;; *) die "--own must be assigned or created";; esac
-    q+=(--data-urlencode "own_type=$own" --data-urlencode "limit=$limit" --data-urlencode "offset=$offset")
-    rows=$(api GET "/dashboard/" "" "${q[@]}")
+    q+=(--data-urlencode "own_type=$own")
+    if [ -n "$limit$offset" ]; then
+      # Explicit --limit/--offset: return exactly that one page.
+      rows=$(api GET "/dashboard/" "" "${q[@]}" \
+               --data-urlencode "limit=${limit:-100}" --data-urlencode "offset=${offset:-0}")
+    else
+      # Otherwise walk every page so callers see all rows (the API caps a page at
+      # whatever limit we send; 100 keeps each response small).
+      rows='{"data":[],"row_count":0}'; off=0
+      while :; do
+        page=$(api GET "/dashboard/" "" "${q[@]}" \
+                 --data-urlencode "limit=100" --data-urlencode "offset=$off")
+        rows=$(jq -c --argjson p "$page" '{data: (.data + ($p.data // [])),
+                 row_count: ($p.row_count // .row_count)}' <<<"$rows")
+        n=$(jq '(.data // []) | length' <<<"$page")
+        off=$((off + n))
+        [ "$n" -gt 0 ] && [ "$off" -lt "$(jq '.row_count // 0' <<<"$page")" ] || break
+      done
+    fi
     [ -n "$by_ws" ] || { printf '%s\n' "$rows"; exit 0; }
     # Map each board to its workspace: directly by channel id, else through the
     # row's old root channel (projects keep it as legacy_root_channel_id).
