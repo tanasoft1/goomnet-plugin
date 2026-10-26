@@ -2,7 +2,14 @@
 
 Lets Claude read and update your tasks on [goomnet](https://goomnet.tanasoft.mn): what's assigned
 to you, boards, comments, creating and closing tasks. Ask in plain language ("what's on my plate
-in goomnet?", "mark 3683 done") or run `/goomnet:goomnet`.
+in goomnet?", "mark 3683 done") or use a slash command:
+
+| Command | What it shows |
+|---|---|
+| `/goomnet:mine [created \| all \| workspace]` | Your open tasks (TODO, IN_PROGRESS) grouped by workspace |
+| `/goomnet:workspaces [name]` | Your workspaces with their projects and boards |
+| `/goomnet:people [workspace]` | Members of each workspace with their role; filter by workspace name |
+| `/goomnet:goomnet <request>` | Anything else, in plain language |
 
 ## Install
 

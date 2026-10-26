@@ -39,6 +39,9 @@ goomnet mine --expired                # overdue
 goomnet mine --due-to 2026-08-31      # due before a date
 
 goomnet mine --channel 34             # ...limited to one board
+goomnet mine --by-workspace           # rows grouped as [{workspace_id, workspace_name, count, tasks}]
+goomnet workspaces                    # workspaces the user belongs to, with their role
+goomnet people [workspace]            # members per workspace; filter by name substring or id
 goomnet tree                          # workspace > project > channel for every workspace
 goomnet channels --type TICKET        # the boards the user belongs to, optionally by type
 goomnet tasks <channel-id> --status TODO --priority URGENT

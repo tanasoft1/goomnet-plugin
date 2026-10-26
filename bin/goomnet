@@ -152,6 +152,22 @@ delete_comment() {  # <content-id> <comment-id> [--force]
   api DELETE "/comments/$cid" ""
 }
 
+# Every workspace the caller belongs to, each with its project > channel tree.
+tree_all() {
+  api GET "/workspace/" "" | jq -c '.[] | {workspace_id, workspace_name}' | while read -r ws; do
+    api GET "/workspace/$(jq -r .workspace_id <<<"$ws")/tree" "" \
+      | jq -c --argjson w "$ws" '$w + {projects: (. // [])}'
+  done | jq -s .
+}
+
+# Workspaces whose name contains <filter> (case-insensitive), or whose id equals it.
+workspaces_matching() {  # [filter]
+  api GET "/workspace/" "" | jq -c --arg f "${1:-}" '[.[]
+    | select($f == "" or (.workspace_id|tostring) == $f
+             or (.workspace_name|ascii_downcase|contains($f|ascii_downcase)))
+    | {workspace_id, workspace_name, role}]'
+}
+
 usage() {
   sed -n '/^## USAGE/,/^## END/p' "$0" | sed '1d;$d;s/^# \{0,1\}//'
   exit "${1:-0}"
@@ -165,6 +181,7 @@ usage() {
 #   channels [--type T]           all channels you belong to
 #       --type TASK|TICKET|NEWS|INCIDENT (repeatable)
 #   workspaces                    workspaces you belong to
+#   people [workspace]            members of each workspace; filter by name or id
 #   tree [workspace-id]           workspace > project > channel hierarchy
 #                                 (all your workspaces when no id is given)
 #   channel <channel-id>          channel detail
@@ -183,6 +200,7 @@ usage() {
 #       filters: --own assigned|created  --status S  --priority P (repeatable)
 #                --channel N  --type TASK|TICKET|INCIDENT  --search TXT
 #                --expired  --pinned  --from/--to D  --due-from/--due-to D
+#                --by-workspace (group rows under their workspace)
 #                --limit N  --offset N
 #   notifs [--limit N] [--unread] your notifications
 #   activity <channel-id>         channel activity timeline
@@ -243,14 +261,16 @@ case "$cmd" in
   # Workspace > project > channel. Projects carry legacy_root_channel_id, the
   # old root channel that the boards used to hang under.
   tree)
-    if [ $# -ge 1 ]; then
-      api GET "/workspace/$1/tree"
-    else
-      api GET "/workspace/" "" | jq -c '.[] | {workspace_id, workspace_name}' | while read -r ws; do
-        api GET "/workspace/$(jq -r .workspace_id <<<"$ws")/tree" "" \
-          | jq -c --argjson w "$ws" '$w + {projects: (. // [])}'
-      done | jq -s .
-    fi
+    if [ $# -ge 1 ]; then api GET "/workspace/$1/tree"; else tree_all; fi
+    ;;
+
+  people)
+    workspaces_matching "${1:-}" | jq -c '.[]' | while read -r ws; do
+      api GET "/workspace/$(jq -r .workspace_id <<<"$ws")/members" "" \
+        | jq -c --argjson w "$ws" '{workspace_id: $w.workspace_id, workspace_name: $w.workspace_name,
+            members: [(. // [])[] | select(.removed_by == null)
+              | {user_id, first_name, last_name, email, role, is_scoped, granted_channel_count}]}'
+    done | jq -s .
     ;;
 
   channel) [ $# -ge 1 ] || die "usage: goomnet channel <channel-id>"
@@ -306,7 +326,7 @@ case "$cmd" in
   # Cross-channel "what's on my plate". NOTE: this endpoint uses PLURAL
   # statuses/priorities, unlike /contents/ which uses the singular forms.
   mine|dashboard)
-    own="ASSIGNED"; q=(--get); limit=100; offset=0
+    own="ASSIGNED"; q=(--get); limit=100; offset=0; by_ws=""
     while [ $# -gt 0 ]; do case "$1" in
       --own)      own=$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]'); shift 2;;
       --status)   q+=(--data-urlencode "statuses=$2");   shift 2;;
@@ -320,13 +340,28 @@ case "$cmd" in
       --to)       q+=(--data-urlencode "cr_date_to=$2");   shift 2;;
       --due-from) q+=(--data-urlencode "end_date_from=$2");shift 2;;
       --due-to)   q+=(--data-urlencode "end_date_to=$2");  shift 2;;
+      --by-workspace) by_ws=1; shift;;
       --limit)    limit="$2"; shift 2;;
       --offset)   offset="$2"; shift 2;;
       *) die "unknown flag $1";;
     esac; done
     case "$own" in ASSIGNED|CREATED) ;; *) die "--own must be assigned or created";; esac
     q+=(--data-urlencode "own_type=$own" --data-urlencode "limit=$limit" --data-urlencode "offset=$offset")
-    api GET "/dashboard/" "" "${q[@]}"
+    rows=$(api GET "/dashboard/" "" "${q[@]}")
+    [ -n "$by_ws" ] || { printf '%s\n' "$rows"; exit 0; }
+    # Map each board to its workspace: directly by channel id, else through the
+    # row's old root channel (projects keep it as legacy_root_channel_id).
+    tree_all | jq -c --argjson rows "$rows" '
+      (map(. as $w | .projects[] | . as $p
+           | ([.channels[]?.channel_id] + [.legacy_root_channel_id // empty])[]
+           | {key: tostring, value: {workspace_id: $w.workspace_id, workspace_name: $w.workspace_name}})
+       | from_entries) as $map
+      | [($rows.Data // $rows.data // [])[]
+         | . + ($map[.channel_id|tostring] // $map[.parent_channel_id|tostring]
+                // {workspace_id: null, workspace_name: "(no workspace)"})]
+      | group_by(.workspace_id)
+      | map({workspace_id: .[0].workspace_id, workspace_name: .[0].workspace_name,
+             count: length, tasks: map(del(.workspace_id, .workspace_name))})'
     ;;
 
   stats)     api GET "/dashboard/stats" ;;
