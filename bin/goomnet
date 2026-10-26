@@ -18,7 +18,7 @@ TOKEN_FILE="$D/.token"
 
 die_unconfigured() {
   echo "goomnet: not configured ($ENV_FILE is missing)." >&2
-  echo "In Claude Code: /plugin > Installed > goomnet > Configure options, then start a new session." >&2
+  echo "In Claude Code run: /plugin configure goomnet@tanasoft  then start a new session." >&2
   exit 1
 }
 

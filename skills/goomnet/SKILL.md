@@ -9,8 +9,8 @@ CLI: `goomnet` — on PATH while this plugin is enabled (bash, needs `curl` + `j
 Always outputs **raw JSON on stdout** — pipe through `jq`. Run `goomnet help` for the full flag list.
 
 If it fails with `not configured`, the user hasn't entered credentials yet: tell them to run
-`/plugin`, open goomnet on the **Installed** tab, choose **Configure options**, enter their goomnet
-email and password, then start a new session. Never ask for the password in chat.
+`/plugin configure goomnet@tanasoft`, enter their goomnet email and password, then start a new
+session. Never ask for the password in chat.
 
 ## Domain model
 
@@ -119,7 +119,7 @@ Swagger spec is stale and should not be trusted.
 
 ## Auth
 
-Credentials come from the plugin's **Configure options** dialog: the password lives in the system
+Credentials come from the plugin's config dialog (`/plugin configure goomnet@tanasoft`): the password lives in the system
 keychain, and a SessionStart hook copies the values into `~/.claude/goomnet/.env` (chmod 600) for
 the CLI. `.token` next to it caches the JWT and refresh token; the CLI auto-refreshes on 401 and
 falls back to a full re-login, so you should never need `goomnet login` explicitly. JWT is RS256,

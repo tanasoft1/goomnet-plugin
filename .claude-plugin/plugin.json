@@ -1,11 +1,18 @@
 {
   "name": "goomnet",
   "displayName": "goomnet",
-  "version": "0.1.0",
   "description": "Read and write the goomnet project tracker (goomnet.tanasoft.mn): your tasks, boards, comments.",
-  "author": { "name": "Tanasoft", "email": "enkhuchral.g@tanasoft.mn" },
+  "author": {
+    "name": "Tanasoft",
+    "email": "enkhuchral.g@tanasoft.mn"
+  },
   "repository": "https://github.com/tanasoft1/goomnet-plugin",
-  "keywords": ["goomnet", "tasks", "tracker", "tanasoft"],
+  "keywords": [
+    "goomnet",
+    "tasks",
+    "tracker",
+    "tanasoft"
+  ],
   "userConfig": {
     "email": {
       "type": "string",
@@ -19,12 +26,6 @@
       "description": "Your goomnet password. Stored in the system keychain, not in settings.json",
       "sensitive": true,
       "required": true
-    },
-    "url": {
-      "type": "string",
-      "title": "goomnet URL",
-      "description": "Base URL of the goomnet server. Leave the default unless told otherwise",
-      "default": "https://goomnet.tanasoft.mn"
     }
   }
 }
