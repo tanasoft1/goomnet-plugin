@@ -122,8 +122,8 @@ guard_delete() {  # <method> <path>
   case "$2" in
     */label/*|*/content-label/*) return 0 ;;   # label deletes are in scope
     /comments/*) return 0 ;;                   # own-comment deletes are in scope (see delete-comment)
-    /channel/*|/contents/*)
-      die "refusing DELETE $2 — destroying channels/tasks is out of scope for this tool (use the web UI)" ;;
+    /channel/*|/contents/*|/workspace/*|/project/*)
+      die "refusing DELETE $2 — destroying workspaces/projects/channels/tasks is out of scope for this tool (use the web UI)" ;;
   esac
 }
 
@@ -162,8 +162,11 @@ usage() {
 #
 # READ
 #   me                            current user + employee info
-#   channels [--org N]            all channels you belong to
-#   tree [--org N] [--limit N]    channel hierarchy
+#   channels [--type T]           all channels you belong to
+#       --type TASK|TICKET|NEWS|INCIDENT (repeatable)
+#   workspaces                    workspaces you belong to
+#   tree [workspace-id]           workspace > project > channel hierarchy
+#                                 (all your workspaces when no id is given)
 #   channel <channel-id>          channel detail
 #   tasks <channel-id> [filters]  tasks/tickets in a channel
 #       filters: --status S (repeatable)  --priority P (repeatable)
@@ -175,16 +178,23 @@ usage() {
 #   members <channel-id>
 #   labels <channel-id>
 #   search <text> [--limit N]     search task content
-#   dashboard                     your cross-channel content
 #   stats                         your dashboard stats
-#   notifs [--limit N]            your notifications
+#   mine [filters]                your cross-channel tasks (alias: dashboard)
+#       filters: --own assigned|created  --status S  --priority P (repeatable)
+#                --channel N  --type TASK|TICKET|INCIDENT  --search TXT
+#                --expired  --pinned  --from/--to D  --due-from/--due-to D
+#                --limit N  --offset N
+#   notifs [--limit N] [--unread] your notifications
 #   activity <channel-id>         channel activity timeline
 #
 # WRITE
 #   create-task <channel-id> <title> [--desc T] [--priority P] [--status S]
-#               [--assignee N] [--start D] [--end D] [--label N]
+#               [--assignee N (repeatable)] [--start D] [--end D] [--label N (repeatable)]
+#               [--parent TICKET_ID] [--bucket N] [--sprint N] [--pinned]
 #   update-task <channel-id> <content-id> [--title T] [--desc T] [--status S]
-#               [--priority P] [--assignee N] [--pinned true|false]
+#               [--priority P] [--assignee N (repeatable, replaces)] [--unassign]
+#               [--start D] [--end D] [--label N (repeatable, replaces)]
+#               [--bucket N] [--sprint N] [--pinned true|false]
 #   comment <channel-id> <content-id> <text> [--reply-to COMMENT_ID]
 #   delete-comment <content-id> <comment-id> [--force]
 #                                 soft-delete a comment. Refuses unless YOU wrote it.
@@ -220,16 +230,27 @@ case "$cmd" in
   me)      api GET "/user-emp/" ;;
 
   channels)
-    org=""; [ "${1:-}" = "--org" ] && { org="$2"; shift 2; }
-    qget "/channel/all" org_id "$org"
+    q=(--get)
+    while [ $# -gt 0 ]; do case "$1" in
+      --type) q+=(--data-urlencode "channel_type=$2"); shift 2;;
+      *) die "unknown flag $1";;
+    esac; done
+    api GET "/channel/all" "" "${q[@]}"
     ;;
 
+  workspaces) api GET "/workspace/" ;;
+
+  # Workspace > project > channel. Projects carry legacy_root_channel_id, the
+  # old root channel that the boards used to hang under.
   tree)
-    org=""; limit=""
-    while [ $# -gt 0 ]; do case "$1" in
-      --org) org="$2"; shift 2;; --limit) limit="$2"; shift 2;; *) die "unknown flag $1";;
-    esac; done
-    qget "/channel/hierarchy/list" org_id "$org" limit "$limit"
+    if [ $# -ge 1 ]; then
+      api GET "/workspace/$1/tree"
+    else
+      api GET "/workspace/" "" | jq -c '.[] | {workspace_id, workspace_name}' | while read -r ws; do
+        api GET "/workspace/$(jq -r .workspace_id <<<"$ws")/tree" "" \
+          | jq -c --argjson w "$ws" '$w + {projects: (. // [])}'
+      done | jq -s .
+    fi
     ;;
 
   channel) [ $# -ge 1 ] || die "usage: goomnet channel <channel-id>"
@@ -291,6 +312,8 @@ case "$cmd" in
       --status)   q+=(--data-urlencode "statuses=$2");   shift 2;;
       --priority) q+=(--data-urlencode "priorities=$2"); shift 2;;
       --search)   q+=(--data-urlencode "search=$2");     shift 2;;
+      --channel)  q+=(--data-urlencode "channel_id=$2"); shift 2;;
+      --type)     q+=(--data-urlencode "content_type=$2"); shift 2;;
       --expired)  q+=(--data-urlencode "is_expired=true"); shift;;
       --pinned)   q+=(--data-urlencode "is_pinned=true");  shift;;
       --from)     q+=(--data-urlencode "cr_date_from=$2"); shift 2;;
@@ -308,8 +331,13 @@ case "$cmd" in
 
   stats)     api GET "/dashboard/stats" ;;
 
-  notifs)   limit=30; [ "${1:-}" = "--limit" ] && limit="$2"
-            qget "/notif" limit "$limit" offset 0 ;;
+  notifs)   limit=30; status=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --limit)  limit="$2"; shift 2;;
+              --unread) status="UNREAD"; shift;;
+              *) die "unknown flag $1";;
+            esac; done
+            qget "/notif" limit "$limit" offset 0 status "$status" ;;
 
   activity) [ $# -ge 1 ] || die "usage: goomnet activity <channel-id>"
             qget "/activity/channel" channel_id "$1" limit 50 offset 0 ;;
@@ -322,10 +350,13 @@ case "$cmd" in
       --desc)     body=$(jq -c --arg v "$2" '.content_description=$v' <<<"$body"); shift 2;;
       --priority) body=$(jq -c --arg v "$2" '.priority=$v'            <<<"$body"); shift 2;;
       --status)   body=$(jq -c --arg v "$2" '.status=$v'              <<<"$body"); shift 2;;
-      --assignee) body=$(jq -c --argjson v "$2" '.assignee_id=$v'     <<<"$body"); shift 2;;
+      --assignee) body=$(jq -c --argjson v "$2" '.assignee_ids=((.assignee_ids//[])+[$v])' <<<"$body"); shift 2;;
       --start)    body=$(jq -c --arg v "$2" '.start_date=$v'          <<<"$body"); shift 2;;
       --end)      body=$(jq -c --arg v "$2" '.end_date=$v'            <<<"$body"); shift 2;;
       --label)    body=$(jq -c --argjson v "$2" '.label=((.label//[])+[$v])' <<<"$body"); shift 2;;
+      --parent)   body=$(jq -c --argjson v "$2" '.parent_ticket_id=$v' <<<"$body"); shift 2;;
+      --bucket)   body=$(jq -c --argjson v "$2" '.bucket_id=$v'       <<<"$body"); shift 2;;
+      --sprint)   body=$(jq -c --argjson v "$2" '.sprint_id=$v'       <<<"$body"); shift 2;;
       --pinned)   body=$(jq -c '.is_pinned=true'                      <<<"$body"); shift;;
       *) die "unknown flag $1";;
     esac; done
@@ -341,7 +372,13 @@ case "$cmd" in
       --desc)     body=$(jq -c --arg v "$2" '.content_description=$v' <<<"$body"); shift 2;;
       --status)   body=$(jq -c --arg v "$2" '.status=$v'              <<<"$body"); shift 2;;
       --priority) body=$(jq -c --arg v "$2" '.priority=$v'            <<<"$body"); shift 2;;
-      --assignee) body=$(jq -c --argjson v "$2" '.assignee_id=$v'     <<<"$body"); shift 2;;
+      --assignee) body=$(jq -c --argjson v "$2" '.assignee_ids=((.assignee_ids//[])+[$v])' <<<"$body"); shift 2;;
+      --unassign) body=$(jq -c '.no_assignee=true'                    <<<"$body"); shift;;
+      --start)    body=$(jq -c --arg v "$2" '.start_date=$v'          <<<"$body"); shift 2;;
+      --end)      body=$(jq -c --arg v "$2" '.end_date=$v'            <<<"$body"); shift 2;;
+      --label)    body=$(jq -c --argjson v "$2" '.label=((.label//[])+[$v])' <<<"$body"); shift 2;;
+      --bucket)   body=$(jq -c --argjson v "$2" '.bucket_id=$v'       <<<"$body"); shift 2;;
+      --sprint)   body=$(jq -c --argjson v "$2" '.sprint_id=$v'       <<<"$body"); shift 2;;
       --pinned)   body=$(jq -c --argjson v "$2" '.is_pinned=$v'       <<<"$body"); shift 2;;
       *) die "unknown flag $1";;
     esac; done
@@ -366,7 +403,7 @@ case "$cmd" in
     [ $# -ge 2 ] || die "usage: goomnet label-create <channel-id> <name> [--color HEX]"
     body=$(jq -nc --argjson c "$1" --arg n "$2" '{channel_id:$c, label_name:$n}')
     shift 2
-    [ "${1:-}" = "--color" ] && body=$(jq -c --arg v "$2" '.color=$v' <<<"$body")
+    [ "${1:-}" = "--color" ] && body=$(jq -c --arg v "$2" '.label_color=$v' <<<"$body")
     api POST "/contents/label" "$body"
     ;;
 

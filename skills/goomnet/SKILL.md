@@ -18,7 +18,9 @@ The API's vocabulary differs from everyday usage — translate before searching:
 
 | User says | API calls it | Notes |
 |---|---|---|
-| project, board | **channel** | hierarchical (`parent_channel_id`); typed `TASK` or `TICKET` |
+| client, company space | **workspace** | top level (`workspace_id`); e.g. Zeely - VIX, Japan Store |
+| project | **project** | inside a workspace; `legacy_root_channel_id` is the old root channel it replaced |
+| board | **channel** | inside a project; typed `TASK`, `TICKET`, `NEWS` or `INCIDENT` |
 | task, ticket, item | **contents** | lives inside a channel; `content_id` is the identifier |
 | comment | comments | hangs off a `content_id` |
 | person | members / assignee | `assignee_id` is a user id (`goomnet me` gives the user's own) |
@@ -36,11 +38,14 @@ goomnet mine --status TODO --status IN_PROGRESS   # open work only
 goomnet mine --expired                # overdue
 goomnet mine --due-to 2026-08-31      # due before a date
 
-goomnet channels                      # the boards the user belongs to
+goomnet mine --channel 34             # ...limited to one board
+goomnet tree                          # workspace > project > channel for every workspace
+goomnet channels --type TICKET        # the boards the user belongs to, optionally by type
 goomnet tasks <channel-id> --status TODO --priority URGENT
 goomnet task <channel-id> <content-id>
 goomnet comments <content-id>
 goomnet stats                         # dashboard counters
+goomnet notifs --unread               # unread notifications
 goomnet search "<text>"
 ```
 
@@ -52,6 +57,8 @@ spans every channel. `goomnet tasks <id>` is for drilling into one board.
 ```bash
 goomnet create-task <channel-id> "<title>" --desc "..." --priority HIGH --status TODO --assignee <user-id>
 goomnet update-task <channel-id> <content-id> --status DONE
+goomnet update-task <channel-id> <content-id> --assignee 10 --assignee 12   # replaces assignees
+goomnet update-task <channel-id> <content-id> --unassign
 goomnet comment <channel-id> <content-id> "<text>"
 ```
 
@@ -59,7 +66,8 @@ Writes hit the user's real team board and are visible to colleagues. **Confirm b
 unless the user's request is unambiguously an instruction to write. There is no undo; the closest
 thing is `--status CANCELLED`.
 
-`DELETE` on channels/contents is deliberately blocked by the CLI (label deletes are allowed).
+`DELETE` on workspaces, projects, channels and contents is deliberately blocked by the CLI
+(label deletes are allowed).
 Deleting is a web-UI action. `delete-comment` refuses to delete a comment the user didn't write.
 
 ## Gotchas that will bite you
@@ -86,9 +94,11 @@ Deleting is a web-UI action. `delete-comment` refuses to delete a comment the us
    context comes as `channel_name` + `parent_channel_name` on the same row, so you rarely need a
    second call.
 
-5. **"How many channels" has two right answers.** `goomnet channels` (`/channel/all`) returns the
-   boards the user belongs to; `goomnet stats` counts more because it also includes the root
-   client workspaces those boards hang under. State which you mean.
+5. **The hierarchy is workspace > project > channel.** The backend is midway through a migration
+   from nested channels: each project points at its old root channel via
+   `legacy_root_channel_id`, and channel rows still carry `parent_channel_id` (that root). So
+   `goomnet channels` returns only the boards, while `goomnet stats` also counts the old root
+   channels. Use `goomnet tree` to place a board, and state which count you mean.
 
 6. **Duplicate channel names are structural, not a bug** — each client workspace can have its own
    board with the same name (for example `TS - Ажлууд` or `Төлөвлөгөө` under several workspaces).
@@ -112,8 +122,9 @@ goomnet raw POST /some/path '{"json":"body"}'
 ```
 
 Path is everything after `/api/web/private`. Auth, token refresh, and error handling still apply.
-Endpoint groups not yet wrapped: `/report`, `/pdf`, `/chat`, `/evaluation`, `/reaction`,
-`/themes`, `/user-report`, `/notif` mutations. The real API contract is the goomnet-backend repo's
+Endpoint groups not yet wrapped: `/project` (projects, sprints, backlog), `/contents/bucket`
+(board columns), `/workspace` management, `/report`, `/pdf`, `/reminder`, `/work-cycle-report`,
+`/sow`, `/contract`, `/evaluation`, `/chat`, `/reaction`, `/user-report`, and `/notif` mutations. The real API contract is the goomnet-backend repo's
 `internal/http/routes/wroutes.go` plus the `Rq*` structs in `internal/http/models/`; its checked-in
 Swagger spec is stale and should not be trusted.
 
